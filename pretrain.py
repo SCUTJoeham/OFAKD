@@ -1,21 +1,5 @@
 #!/usr/bin/env python3
-""" ImageNet Training Script
 
-This is intended to be a lean and easily modifiable ImageNet training script that reproduces ImageNet
-training results with some of the latest networks and training techniques. It favours canonical PyTorch
-and standard Python style over trying to be able to 'do it all.' That said, it offers quite a few speed
-and training result improvements over the usual PyTorch example scripts. Repurpose as you see fit.
-
-This script was started from an early version of the PyTorch ImageNet example
-(https://github.com/pytorch/examples/tree/master/imagenet)
-
-NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
-(https://github.com/NVIDIA/apex/tree/master/examples/imagenet)
-
-Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
-
-Modifications by Zhiwei Hao (haozhw@bit.edu.cn)
-"""
 import argparse
 import logging
 import os
@@ -39,8 +23,6 @@ from timm.scheduler import create_scheduler
 from timm.utils import *
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
-from custom_forward import register_new_forward
-from distillers import get_distiller
 from utils import CIFAR100InstanceSample, ImageNetInstanceSample, TimePredictor
 from custom_model import *
 
@@ -71,53 +53,8 @@ parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 
-# ------------------------------------- My params ---------------------------------------
 # Basic parameters
 parser.add_argument('--model', default='resnet18', type=str)
-parser.add_argument('--teacher', default='deit_tiny_patch16_224', type=str)
-parser.add_argument('--teacher-pretrained', default='', type=str)
-parser.add_argument('--distiller', default='ofa', type=str)
-parser.add_argument('--gt-loss-weight', default=1., type=float)
-parser.add_argument('--kd-loss-weight', default=1., type=float)
-
-# KD parameters
-parser.add_argument('--kd-temperature', default=1, type=float)
-
-# OFA parameters
-parser.add_argument('--ofa-eps', default=[1], nargs='+', type=float)
-parser.add_argument('--ofa-stage', default=[1, 2, 3, 4], nargs='+', type=int)
-parser.add_argument('--ofa-loss-weight', default=1, type=float)
-parser.add_argument('--ofa-temperature', default=1, type=float)
-
-# DIST parameters
-parser.add_argument('--dist-beta', default=1, type=float)
-parser.add_argument('--dist-gamma', default=1, type=float)
-parser.add_argument('--dist-tau', default=1, type=float)
-
-# DKD parameters
-parser.add_argument('--dkd-alpha', default=1, type=float)
-parser.add_argument('--dkd-beta', default=2, type=float)
-parser.add_argument('--dkd-temperature', default=1, type=float)
-
-# Correlation parameters
-parser.add_argument('--correlation-scale', default=0.02, type=float)
-parser.add_argument('--correlation-feat-dim', default=128, type=int)
-
-# CRD parameters
-parser.add_argument('--crd-feat-dim', default=128, type=int)
-parser.add_argument('--crd-k', default=16384, type=int)
-parser.add_argument('--crd-momentum', default=0.5, type=float)
-parser.add_argument('--crd-temperature', default=0.07, type=float)
-
-# RKD parameters
-parser.add_argument('--rkd-distance-weight', default=25, type=float)
-parser.add_argument('--rkd-angle-weight', default=50, type=float)
-parser.add_argument('--rkd-eps', default=1e-12, type=float)
-parser.add_argument('--rkd-squared', action='store_true', default=False)
-
-# FitNet parameters
-parser.add_argument('--fitnet-stage', default=[1, 2, 3, 4], nargs='+', type=int)
-parser.add_argument('--fitnet-loss-weight', default=1, type=float)
 
 # Misc
 parser.add_argument('--speedtest', action='store_true')
@@ -308,10 +245,6 @@ parser.add_argument('--model-ema-force-cpu', action='store_true', default=False,
 parser.add_argument('--model-ema-decay', type=float, default=[0.9998], nargs='+',
                     help='decay factor for model weights moving average (default: 0.9998)')
 
-# XFD parameters
-parser.add_argument('--xfd-stage', default=[1, 2, 3, 4], nargs='+', type=int)
-parser.add_argument('--xfd-loss-weight', default=1, type=float)
-
 # Misc
 parser.add_argument('--seed', type=int, default=42, metavar='S',
                     help='random seed (default: 42)')
@@ -374,7 +307,7 @@ def main():
     setup_default_logging(log_path='train.log')
     args, args_text = _parse_args()
 
-    args.prefetcher = (not args.no_prefetcher) and (args.distiller != 'crd')
+    args.prefetcher = not args.no_prefetcher
     args.distributed = False
     if 'WORLD_SIZE' in os.environ:
         args.distributed = int(os.environ['WORLD_SIZE']) > 1
@@ -418,8 +351,6 @@ def main():
 
     random_seed(args.seed, args.rank)
 
-    Distiller = get_distiller(args.distiller)
-
     model = create_model(
         args.model,
         pretrained=args.pretrained,
@@ -432,20 +363,6 @@ def main():
         bn_momentum=args.bn_momentum,
         bn_eps=args.bn_eps,
         checkpoint_path=args.initial_checkpoint)
-    if Distiller.requires_feat:
-        register_new_forward(model)
-
-    teacher = None
-    if args.teacher:
-        teacher = create_model(
-            args.teacher,
-            checkpoint_path=args.teacher_pretrained,
-            num_classes=args.num_classes)
-        if Distiller.requires_feat:
-            register_new_forward(teacher)
-
-        teacher.requires_grad_(False)
-        teacher.eval()
 
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
@@ -483,24 +400,16 @@ def main():
 
     # create the train and eval datasets
     if args.dataset == 'cifar100':
-        if args.distiller == 'crd':
-            dataset_train = CIFAR100InstanceSample(root=args.data_dir, train=True, is_sample=True, k=args.crd_k)
-        else:
-            dataset_train = torchvision.datasets.CIFAR100(args.data_dir, train=True)
+        dataset_train = torchvision.datasets.CIFAR100(args.data_dir, train=True)
         dataset_eval = torchvision.datasets.CIFAR100(args.data_dir, train=False)
 
     else:
-        if args.distiller == 'crd':
-            dataset_train = ImageNetInstanceSample(root=f'{args.data_dir}/train', name=args.dataset,
-                                                   class_map=args.class_map, load_bytes=False, is_sample=True,
-                                                   k=args.crd_k)
-        else:
-            dataset_train = create_dataset(
-                args.dataset, root=args.data_dir, split=args.train_split, is_training=True,
-                class_map=args.class_map,
-                download=args.dataset_download,
-                batch_size=args.batch_size,
-                repeats=args.epoch_repeats)
+        dataset_train = create_dataset(
+            args.dataset, root=args.data_dir, split=args.train_split, is_training=True,
+            class_map=args.class_map,
+            download=args.dataset_download,
+            batch_size=args.batch_size,
+            repeats=args.epoch_repeats)
 
         dataset_eval = create_dataset(
             args.dataset, root=args.data_dir, split=args.val_split, is_training=False,
@@ -526,26 +435,27 @@ def main():
             train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
         train_loss_fn = nn.CrossEntropyLoss()
+    train_loss_fn = train_loss_fn.cuda()
     validate_loss_fn = nn.CrossEntropyLoss().cuda()
 
-    distiller = Distiller(model, teacher=teacher, criterion=train_loss_fn, args=args, num_data=len(dataset_train))
-    student_params, extra_params = distiller.get_learnable_parameters()
+    learnable_params = 0
+    for _, p in model.named_parameters():
+        if p.requires_grad:
+            learnable_params += p.numel()
     if args.rank == 0:
         _logger.info(f'\n-------------------------------'
-                     f'\nLearnable parameters'
-                     f'\nStudent: {student_params / 1e6:.2f}M'
-                     f'\nExtra: {extra_params / 1e6:.2f}M'
+                     f'\nLearnable parameters: {learnable_params / 1e6:.2f}M'
                      f'\n-------------------------------')
 
-    distiller = distiller.cuda()
+    model = model.cuda()
 
-    optimizer = create_optimizer_v2(distiller, **optimizer_kwargs(cfg=args))
+    optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
 
     # setup automatic mixed-precision (AMP) loss scaling and op casting
     amp_autocast = suppress  # do nothing
     loss_scaler = None
     if use_amp == 'apex':
-        distiller, optimizer = amp.initialize(distiller, optimizer, opt_level='O1')
+        model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
         loss_scaler = ApexScaler()
         if args.rank == 0:
             _logger.info('Using NVIDIA APEX AMP. Training in mixed precision.')
@@ -573,11 +483,11 @@ def main():
             # Apex DDP preferred unless native amp is activated
             if args.rank == 0:
                 _logger.info("Using NVIDIA APEX DistributedDataParallel.")
-            distiller = ApexDDP(distiller, delay_allreduce=True)
+            model = ApexDDP(model, delay_allreduce=True)
         else:
             if args.rank == 0:
                 _logger.info("Using native Torch DistributedDataParallel.")
-            distiller = NativeDDP(distiller, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb)
+            model = NativeDDP(model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb)
         # NOTE: EMA model does not need to be wrapped by DDP
 
     # setup learning rate schedule and starting epoch
@@ -676,7 +586,7 @@ def main():
                 model_name_parser(safe_model_name(args.model)),
                 str(data_config['input_size'][-1])
             ])
-        output_dir = get_outdir(args.output if args.output else './output/train_z', exp_name)
+        output_dir = get_outdir(args.output if args.output else './output/train', exp_name)
         decreasing = True if eval_metric == 'loss' else False
         saver_dir = os.path.join(output_dir, 'checkpoint')
         os.makedirs(saver_dir)
@@ -706,14 +616,14 @@ def main():
                 loader_train.sampler.set_epoch(epoch)
 
             train_metrics = train_one_epoch(
-                epoch, distiller, loader_train, optimizer, args,
+                epoch, model, loader_train, train_loss_fn, optimizer, args,
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
                 amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_emas=model_emas, mixup_fn=mixup_fn)
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                 if args.rank == 0:
                     _logger.info("Distributing BatchNorm running means and vars")
-                distribute_bn(distiller, args.world_size, args.dist_bn == 'reduce')
+                distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
 
             is_eval = epoch > int(args.eval_interval_end * args.epochs) or epoch % args.eval_interval == 0
             if not args.speedtest and is_eval:
@@ -763,7 +673,7 @@ def main():
 
 
 def train_one_epoch(
-        epoch, distiller, loader, optimizer, args,
+        epoch, model, loader, loss_fn, optimizer, args,
         lr_scheduler=None, saver=None, output_dir=None, amp_autocast=suppress,
         loss_scaler=None, model_emas=None, mixup_fn=None):
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
@@ -776,13 +686,8 @@ def train_one_epoch(
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
     losses_m = AverageMeter()
-    losses_gt_m = AverageMeter()
-    losses_kd_m = AverageMeter()
 
-    from collections import defaultdict
-    losses_m_dict = defaultdict(AverageMeter)
-
-    distiller.train()
+    model.train()
 
     end = time.time()
     last_idx = len(loader) - 1
@@ -798,35 +703,35 @@ def train_one_epoch(
 
         with amp_autocast():
 
-            output, losses_dict = distiller(input, target, *additional_input, epoch=epoch)
-            loss = sum(losses_dict.values())
+            output_logits = model(input)
+            loss = loss_fn(output_logits, target)
 
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))
-            for k in losses_dict:
-                losses_m_dict[k].update(losses_dict[k].item(), input.size(0))
+            # for k in losses_dict:
+            #     losses_m_dict[k].update(losses_dict[k].item(), input.size(0))
 
         optimizer.zero_grad()
         if loss_scaler is not None:
             loss_scaler(
                 loss, optimizer,
                 clip_grad=args.clip_grad, clip_mode=args.clip_mode,
-                parameters=model_parameters(distiller, exclude_head='agc' in args.clip_mode),
+                parameters=model_parameters(model, exclude_head='agc' in args.clip_mode),
                 create_graph=second_order)
         else:
             loss.backward(create_graph=second_order)
             if args.clip_grad is not None:
                 dispatch_clip_grad(
-                    model_parameters(distiller, exclude_head='agc' in args.clip_mode),
+                    model_parameters(model, exclude_head='agc' in args.clip_mode),
                     value=args.clip_grad, mode=args.clip_mode)
             optimizer.step()
 
         if model_emas is not None:
             for ema, _ in model_emas:
-                if hasattr(distiller, 'module'):
-                    ema.update(distiller.module.student)
+                if hasattr(model, 'module'):
+                    ema.update(model.module.student)
                 else:
-                    ema.update(distiller.student)
+                    ema.update(model.student)
 
         torch.cuda.synchronize()
         num_updates += 1
@@ -837,33 +742,18 @@ def train_one_epoch(
 
             if args.distributed:
                 reduced_loss = reduce_tensor(loss.data, args.world_size)
-                reduced_loss_dict = {}
-                for k in losses_dict:
-                    reduced_loss_dict[k] = reduce_tensor(losses_dict[k].data, args.world_size)
-
                 losses_m.update(reduced_loss.item(), input.size(0))
-                for k in reduced_loss_dict:
-                    losses_m_dict[k].update(reduced_loss_dict[k].item(), input.size(0))
 
             if args.rank == 0:
-                losses_infos = []
-                for k, v in losses_m_dict.items():
-                    info = f'{k.capitalize()}: {v.val:#.4g} ({v.avg:#.3g})'
-                    losses_infos.append(info)
-                losses_info = '  '.join(losses_infos)
 
                 _logger.info(
                     'Train: {} [{:>4d}/{} ({:>3.0f}%)]  '
                     'Loss: {loss.val:#.4g} ({loss.avg:#.3g})  '
-                    '{losses_info} '
                     'LR: {lr:.3e}'.format(
                         epoch,
                         batch_idx, len(loader),
                         100. * batch_idx / last_idx,
                         loss=losses_m,
-                        loss_gt=losses_gt_m,
-                        loss_kd=losses_kd_m,
-                        losses_info=losses_info,
                         lr=lr))
 
                 if args.save_images and output_dir:
